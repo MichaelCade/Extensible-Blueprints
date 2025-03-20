@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: elasticache-backup-config
+  namespace: elasticache-backup
+  annotations:
+    kanister.kasten.io/blueprint: elasticache-backup-blueprint
+data:
+  AWS_REGION: "us-east-1"
+  REPLICATION_GROUP_ID: "veeam-demo-cluster"
+  RESTORED_REPLICATION_GROUP_ID: "veeam-demo-cluster-restored"
+  CACHE_CLUSTER_ID: veeam-demo-cluster-001

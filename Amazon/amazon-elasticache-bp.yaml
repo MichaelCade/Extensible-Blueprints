@@ -1,0 +1,208 @@
+apiVersion: cr.kanister.io/v1alpha1
+kind: Blueprint
+metadata:
+  name: elasticache-backup-blueprint
+  namespace: kasten-io
+  annotations:
+    description: "This blueprint will backup and restore an Amazon ElastiCache cluster."
+actions:
+  backup:
+    phases:
+      - func: KubeTask
+        name: createElastiCacheSnapshot
+        args:
+          namespace: elasticache-backup
+          image: amazon/aws-cli:latest
+          podOverride:
+            containers:
+              - name: container
+                image: amazon/aws-cli:latest
+                env:
+                  - name: AWS_REGION
+                    valueFrom:
+                      configMapKeyRef:
+                        name: elasticache-backup-config
+                        key: AWS_REGION
+                  - name: AWS_ACCESS_KEY_ID
+                    valueFrom:
+                      secretKeyRef:
+                        name: elasticache-backup-secret
+                        key: AWS_ACCESS_KEY_ID
+                  - name: AWS_SECRET_ACCESS_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: elasticache-backup-secret
+                        key: AWS_SECRET_ACCESS_KEY
+                  - name: CACHE_CLUSTER_ID
+                    valueFrom:
+                      configMapKeyRef:
+                        name: elasticache-backup-config
+                        key: CACHE_CLUSTER_ID
+          command:
+            - sh
+            - -c
+            - |
+              export AWS_REGION="$AWS_REGION"
+              export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+              export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+              export AWS_PAGER=""  # Disable pager
+
+              SNAPSHOT_NAME=snapshot-$(date +%Y%m%d%H%M%S)
+              echo "Creating snapshot: $SNAPSHOT_NAME for cache cluster $CACHE_CLUSTER_ID in region $AWS_REGION"
+
+              aws elasticache create-snapshot \
+                --region "$AWS_REGION" \
+                --cache-cluster-id "$CACHE_CLUSTER_ID" \
+                --snapshot-name "$SNAPSHOT_NAME"
+
+              if [ $? -eq 0 ]; then
+                echo "Snapshot creation command executed successfully."
+              else
+                echo "Snapshot creation failed."
+                exit 1
+              fi
+
+              echo "Waiting for snapshot $SNAPSHOT_NAME to become available..."
+              TIMEOUT=600
+              ELAPSED=0
+              while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+                SNAPSHOT_STATUS=$(aws elasticache describe-snapshots \
+                  --region "$AWS_REGION" \
+                  --snapshot-name "$SNAPSHOT_NAME" \
+                  --query "Snapshots[0].SnapshotStatus" \
+                  --output text)
+
+                if [ "$SNAPSHOT_STATUS" == "available" ]; then
+                  echo "Snapshot $SNAPSHOT_NAME is now available."
+                  break
+                fi
+
+                echo "Snapshot status: $SNAPSHOT_STATUS. Waiting..."
+                sleep 30
+                ELAPSED=$((ELAPSED + 30))
+              done
+
+              if [ "$SNAPSHOT_STATUS" != "available" ]; then
+                echo "Snapshot $SNAPSHOT_NAME did not become available in time."
+                exit 1
+              fi
+
+              echo "Backup completed successfully."
+              exit 0
+  restore:
+    phases:
+      - func: KubeTask
+        name: restoreElastiCacheSnapshot
+        args:
+          namespace: elasticache-backup
+          image: amazon/aws-cli:latest
+          podOverride:
+            containers:
+              - name: container
+                image: amazon/aws-cli:latest
+                env:
+                  - name: AWS_REGION
+                    valueFrom:
+                      configMapKeyRef:
+                        name: elasticache-backup-config
+                        key: AWS_REGION
+                  - name: AWS_ACCESS_KEY_ID
+                    valueFrom:
+                      secretKeyRef:
+                        name: elasticache-backup-secret
+                        key: AWS_ACCESS_KEY_ID
+                  - name: AWS_SECRET_ACCESS_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: elasticache-backup-secret
+                        key: AWS_SECRET_ACCESS_KEY
+                  - name: CACHE_CLUSTER_ID
+                    valueFrom:
+                      configMapKeyRef:
+                        name: elasticache-backup-config
+                        key: CACHE_CLUSTER_ID
+                  - name: REPLICATION_GROUP_ID
+                    valueFrom:
+                      configMapKeyRef:
+                        name: elasticache-backup-config
+                        key: REPLICATION_GROUP_ID
+                  - name: RESTORED_REPLICATION_GROUP_ID
+                    valueFrom:
+                      configMapKeyRef:
+                        name: elasticache-backup-config
+                        key: RESTORED_REPLICATION_GROUP_ID
+          command:
+            - sh
+            - -c
+            - |
+              export AWS_REGION="$AWS_REGION"
+              export AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
+              export AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
+              export REPLICATION_GROUP_ID="$REPLICATION_GROUP_ID"
+              export RESTORED_REPLICATION_GROUP_ID="$RESTORED_REPLICATION_GROUP_ID"
+              export AWS_PAGER=""
+
+              echo "Fetching latest snapshot for cache cluster $CACHE_CLUSTER_ID in $AWS_REGION"
+
+              LATEST_SNAPSHOT=$(aws elasticache describe-snapshots \
+                --region "$AWS_REGION" \
+                --cache-cluster-id "$CACHE_CLUSTER_ID" \
+                --query "Snapshots | sort_by(@, &NodeSnapshots[0].SnapshotCreateTime) | [-1].SnapshotName" \
+                --output text)
+
+              if [ "$LATEST_SNAPSHOT" == "None" ]; then
+                echo "No snapshot found! Exiting."
+                exit 1
+              fi
+
+              echo "Latest snapshot found: $LATEST_SNAPSHOT"
+
+              echo "Checking if replication group $REPLICATION_GROUP_ID exists..."
+              GROUP_STATUS=$(aws elasticache describe-replication-groups \
+                --region "$AWS_REGION" \
+                --replication-group-id "$REPLICATION_GROUP_ID" \
+                --query "ReplicationGroups[0].Status" \
+                --output text 2>/dev/null || echo "not-found")
+
+              if [ "$GROUP_STATUS" != "not-found" ]; then
+                echo "Replication group exists with status: $GROUP_STATUS. Deleting..."
+                
+                aws elasticache delete-replication-group \
+                  --region "$AWS_REGION" \
+                  --replication-group-id "$REPLICATION_GROUP_ID"
+
+                echo "Waiting for replication group deletion..."
+                while true; do
+                  GROUP_STATUS=$(aws elasticache describe-replication-groups \
+                    --region "$AWS_REGION" \
+                    --replication-group-id "$REPLICATION_GROUP_ID" \
+                    --query "ReplicationGroups[0].Status" \
+                    --output text 2>/dev/null || echo "not-found")
+
+                  if [ "$GROUP_STATUS" == "not-found" ]; then
+                    echo "Replication group deleted successfully."
+                    break
+                  fi
+
+                  echo "Still deleting... waiting..."
+                  sleep 20
+                done
+              else
+                echo "No existing replication group found."
+              fi
+
+              echo "Creating new replication group from snapshot..."
+              aws elasticache create-replication-group \
+                --region "$AWS_REGION" \
+                --replication-group-id "$RESTORED_REPLICATION_GROUP_ID" \
+                --replication-group-description "Restored ElastiCache replication group" \
+                --snapshot-name "$LATEST_SNAPSHOT" \
+                --engine redis \
+                --cache-node-type cache.t3.micro \
+                --num-node-groups 1 \
+                --replicas-per-node-group 1 \
+                --automatic-failover-enabled
+
+              echo "Replication group restore initiated successfully."
+              exit 0
+  

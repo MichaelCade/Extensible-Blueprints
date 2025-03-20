@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: elasticache-backup-debug-pod
+  namespace: kasten-io
+spec:
+  containers:
+  - name: aws-kubectl
+    image: amazon/aws-cli:latest
+    command: [ "sleep", "3600" ]
+    env:
+    - name: AWS_REGION
+      valueFrom:
+        configMapKeyRef:
+          name: elasticache-backup-config
+          key: AWS_REGION
+          namespace: elasticache-backup
+    - name: CACHE_CLUSTER_ID
+      valueFrom:
+        configMapKeyRef:
+          name: elasticache-backup-config
+          key: CACHE_CLUSTER_ID
+          namespace: elasticache-backup
+    - name: AWS_ACCESS_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: elasticache-backup-secret
+          key: AWS_ACCESS_KEY_ID
+          namespace: elasticache-backup
+    - name: AWS_SECRET_ACCESS_KEY
+      valueFrom:
+        secretKeyRef:
+          name: elasticache-backup-secret
+          key: AWS_SECRET_ACCESS_KEY
+          namespace: elasticache-backup
